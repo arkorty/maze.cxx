@@ -1,12 +1,14 @@
-#include <chrono>
+#include <array>
+#include <condition_variable>
+#include <fstream>
 #include <iostream>
 #include <memory>
-#include <thread>
-#include <vector>
-
+#include <mutex>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 class Entity {
   public:
@@ -43,106 +45,98 @@ class Game {
     size_t termColSize;
     size_t termRowSize;
     std::unique_ptr<Maze> maze;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool updateNeeded;
     bool quitGame;
     bool winGame;
 
+    static constexpr std::array<char, 5> sprites = {' ', 'H', '*', 'X', 'O'};
+
   public:
-    Game() : quitGame(false), winGame(false) {}
+    Game() : updateNeeded(false), quitGame(false), winGame(false) {}
 
     void getTermSize() {
         struct winsize w;
-        ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1) {
+            throw std::runtime_error("Failed to get terminal size");
+        }
         termRowSize = w.ws_row;
         termColSize = w.ws_col;
     }
 
-    void termTooSmallHandler() {
+    void termTooSmallHandler() const {
         if (termColSize < 2 * maze->rowSize || termRowSize < maze->colSize) {
-            std::cout << "Terminal is too small to display the whole maze.\n"
-                         "Either make the terminal window bigger, or use a smaller maze map.\n";
-            exit(0);
         }
     }
 
-    void getMazeSize(const char *path) {
-        FILE *file;
-        if (!(file = fopen(path, "r"))) {
-            std::cout << "Couldn't find map file. Check file path.\n";
-            exit(0);
+    void getMazeSize(const std::string &path) {
+        std::ifstream file(path);
+        if (!file) {
+            throw std::runtime_error("Couldn't find map file. Check file path.");
         }
 
-        char ch;
+        std::string line;
         size_t x_cnt = 0;
         size_t y_cnt = 0;
-        bool cnt_x = true;
-        while ((ch = getc(file)) != EOF) {
-            if (ch == '\n') {
-                ++y_cnt;
-                cnt_x = false;
-            } else if (cnt_x) {
-                ++x_cnt;
-            }
+        if (std::getline(file, line)) {
+            x_cnt = line.length();
+            y_cnt = 1;
+        }
+        while (std::getline(file, line)) {
+            ++y_cnt;
         }
 
         maze->rowSize = x_cnt;
         maze->colSize = y_cnt;
     }
 
-    void restoreCursor() { std::cout << "\033[u"; }
+    void move(Entity::Move move) {
+        auto &player = maze->player;
+        auto &pntr = maze->pntr;
 
-    void saveCursor() { std::cout << "\033[s"; }
+        auto updatePosition = [&](int dx, int dy) {
+            if (player->xIdx == maze->start->xIdx && player->yIdx == maze->start->yIdx) {
+                pntr[player->yIdx][player->xIdx] = 2;
+            } else {
+                pntr[player->yIdx][player->xIdx] = 0;
+            }
+            player->xIdx += dx;
+            player->yIdx += dy;
+            pntr[player->yIdx][player->xIdx] = 4;
+        };
+
+        switch (move) {
+        case Entity::Move::Left:
+            if (player->xIdx != 0 && pntr[player->yIdx][player->xIdx - 1] != 1) {
+                updatePosition(-1, 0);
+            }
+            break;
+        case Entity::Move::Down:
+            if (player->yIdx != maze->colSize - 1 && pntr[player->yIdx + 1][player->xIdx] != 1) {
+                updatePosition(0, 1);
+            }
+            break;
+        case Entity::Move::Up:
+            if (player->yIdx != 0 && pntr[player->yIdx - 1][player->xIdx] != 1) {
+                updatePosition(0, -1);
+            }
+            break;
+        case Entity::Move::Right:
+            if (player->xIdx != maze->rowSize - 1 && pntr[player->yIdx][player->xIdx + 1] != 1) {
+                updatePosition(1, 0);
+            }
+            break;
+        }
+    }
+
+    void restoreCursor() const { std::cout << "\033[u"; }
+
+    void saveCursor() const { std::cout << "\033[s"; }
 
     void zeroCursor() { std::cout << "\033[0;0H" << std::flush; }
 
-    void move(Entity::Move move) {
-        if (move == Entity::Move::Left && maze->player->xIdx != 0 &&
-            maze->pntr[maze->player->yIdx][maze->player->xIdx - 1] != 1) {
-            if (maze->player->xIdx == maze->start->xIdx && maze->player->yIdx == maze->start->yIdx) {
-                maze->pntr[maze->player->yIdx][maze->player->xIdx] = 2;
-            } else {
-                maze->pntr[maze->player->yIdx][maze->player->xIdx] = 0;
-            }
-            --maze->player->xIdx;
-            maze->pntr[maze->player->yIdx][maze->player->xIdx] = 4;
-        }
-        if (move == Entity::Move::Down && maze->player->yIdx != maze->colSize - 1 &&
-            maze->pntr[maze->player->yIdx + 1][maze->player->xIdx] != 1) {
-            if (maze->player->xIdx == maze->start->xIdx && maze->player->yIdx == maze->start->yIdx) {
-                maze->pntr[maze->player->yIdx][maze->player->xIdx] = 2;
-            } else {
-                maze->pntr[maze->player->yIdx][maze->player->xIdx] = 0;
-            }
-            ++maze->player->yIdx;
-            maze->pntr[maze->player->yIdx][maze->player->xIdx] = 4;
-        }
-        if (move == Entity::Move::Up && maze->player->yIdx != 0 &&
-            maze->pntr[maze->player->yIdx - 1][maze->player->xIdx] != 1) {
-            if (maze->player->xIdx == maze->start->xIdx && maze->player->yIdx == maze->start->yIdx) {
-                maze->pntr[maze->player->yIdx][maze->player->xIdx] = 2;
-            } else {
-                maze->pntr[maze->player->yIdx][maze->player->xIdx] = 0;
-            }
-            --maze->player->yIdx;
-            maze->pntr[maze->player->yIdx][maze->player->xIdx] = 4;
-        }
-        if (move == Entity::Move::Right && maze->player->xIdx != maze->rowSize - 1 &&
-            maze->pntr[maze->player->yIdx][maze->player->xIdx + 1] != 1) {
-            if (maze->player->xIdx == maze->start->xIdx && maze->player->yIdx == maze->start->yIdx) {
-                maze->pntr[maze->player->yIdx][maze->player->xIdx] = 2;
-            } else {
-                maze->pntr[maze->player->yIdx][maze->player->xIdx] = 0;
-            }
-            ++maze->player->xIdx;
-            maze->pntr[maze->player->yIdx][maze->player->xIdx] = 4;
-        }
-    }
-
-    void freeMap() {
-        // Free memory for maze and entities
-        maze.reset();
-    }
-
-    void allocMazeBuffer(const char *path) {
+    void allocMazeBuffer(const std::string &path) {
         maze = std::make_unique<Maze>(0, 0);
         maze->player = std::make_unique<Entity>(0, 0);
         maze->start = std::make_unique<Entity>(0, 0);
@@ -152,38 +146,33 @@ class Game {
         maze->pntr.resize(maze->colSize, std::vector<uint32_t>(maze->rowSize, 0));
     }
 
-    void loadMazeToBuffer(const char *path) {
-        FILE *file;
-        if (!(file = fopen(path, "r"))) {
-            std::cout << "Couldn't find map file. Check file path.\n";
-            exit(0);
+    void loadMazeToBuffer(const std::string &path) {
+        std::ifstream file(path);
+        if (!file) {
+            throw std::runtime_error("Couldn't find map file. Check file path.");
         }
 
+        std::string line;
         size_t y_cord = 0;
-        size_t x_cord = 0;
-
-        char cur;
-        while (EOF != (cur = getc(file))) {
-            if ('\n' == cur) {
-                x_cord = 0;
-                ++y_cord;
-                continue;
-            } else if ('4' == cur) {
-                maze->player->xIdx = x_cord;
-                maze->player->yIdx = y_cord;
-                maze->start->xIdx = x_cord;
-                maze->start->yIdx = y_cord;
-            } else if ('3' == cur) {
-                maze->end->xIdx = x_cord;
-                maze->end->yIdx = y_cord;
+        while (std::getline(file, line)) {
+            for (size_t x_cord = 0; x_cord < line.length(); ++x_cord) {
+                char cur = line[x_cord];
+                if (cur == '4') {
+                    maze->player->xIdx = x_cord;
+                    maze->player->yIdx = y_cord;
+                    maze->start->xIdx = x_cord;
+                    maze->start->yIdx = y_cord;
+                } else if (cur == '3') {
+                    maze->end->xIdx = x_cord;
+                    maze->end->yIdx = y_cord;
+                }
+                maze->pntr[y_cord][x_cord] = static_cast<uint32_t>(cur - '0');
             }
-            maze->pntr[y_cord][x_cord] = (uint32_t)(cur - '0');
-            ++x_cord;
+            ++y_cord;
         }
     }
 
-    void print() {
-        const char sprites[] = " H*XO";
+    void print() const {
         saveCursor();
         for (size_t y_cord = 0; y_cord < maze->colSize; ++y_cord) {
             for (size_t x_cord = 0; x_cord < maze->rowSize; ++x_cord) {
@@ -205,7 +194,6 @@ class Game {
         struct termios raw;
         tcgetattr(STDIN_FILENO, &raw);
         tcgetattr(STDIN_FILENO, &term_state);
-        ////    atexit(&Game::setTermDef);
 
         raw.c_lflag &= ~(ECHO | ICANON);
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
@@ -249,23 +237,42 @@ class Game {
             case 'd':
                 move(Entity::Move::Right);
                 break;
+            default:
+                continue;
             }
 
             checkWin();
             if (winGame) {
                 break;
             }
+
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                updateNeeded = true;
+            }
+            cv.notify_one();
         }
 
         quitGame = true;
+        cv.notify_one();
     }
 
     void update() {
         zeroCursor();
         clear();
+        print();
+
         while (!quitGame) {
-            print();
-            std::this_thread::sleep_for(std::chrono::microseconds(41667));
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [this] { return updateNeeded || quitGame; });
+
+            if (quitGame)
+                break;
+
+            if (updateNeeded) {
+                print();
+                updateNeeded = false;
+            }
         }
 
         if (winGame) {
@@ -280,7 +287,11 @@ class Game {
     }
 
     void startGame(int argc, char *argv[]) {
-        if (argc > 1 && argc < 3) {
+        if (argc != 2) {
+            throw std::runtime_error("Usage: " + std::string(argv[0]) + " <maze_file>");
+        }
+
+        try {
             getTermSize();
             allocMazeBuffer(argv[1]);
             termTooSmallHandler();
@@ -291,6 +302,9 @@ class Game {
 
             updateThread.join();
             captureThread.join();
+        } catch (const std::exception &e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+            exit(1);
         }
     }
 };
